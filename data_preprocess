@@ -1,0 +1,39 @@
+from PIL import Image
+import numpy as np
+import os
+
+def pixelize_strict(img, grid_size=64, target_size=512):
+    """
+    img: PIL Image RGB
+    grid_size: 目标像素格数量，例如 64x64
+    target_size: 最终训练图像大小，例如 512x512
+    """
+    # 1. 缩小到像素格数
+    img_small = img.resize((grid_size, grid_size), Image.NEAREST)
+    
+    # 2. 转灰度
+    img_gray = img_small.convert("L")
+    
+    # 3. 二值化
+    arr = np.array(img_gray)
+    arr = np.where(arr > 127, 255, 0).astype(np.uint8)
+    
+    # 4. 放大回训练分辨率
+    img_pixel = Image.fromarray(arr).resize((target_size, target_size), Image.NEAREST)
+    
+    return img_pixel
+
+# -------------------
+# 保存处理后的训练集
+# -------------------
+input_dir = "dataset/1bit/raw"
+output_dir = "dataset/1bit/pre_train"
+os.makedirs(output_dir, exist_ok=True)
+
+for fname in os.listdir(input_dir):
+    if not fname.lower().endswith((".png", ".jpg", ".jpeg")):
+        continue
+    img = Image.open(os.path.join(input_dir, fname)).convert("RGB")
+    img_pixel = pixelize_strict(img, grid_size=64, target_size=512)
+    save_path = os.path.join(output_dir, fname)
+    img_pixel.save(save_path)
