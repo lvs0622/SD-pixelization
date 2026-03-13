@@ -1,0 +1,175 @@
+import torch
+import torch.nn.functional as F
+import os
+from typing import Optional, Union, Tuple
+from PIL import Image
+import cv2
+import numpy as np
+
+from diffusers import (
+    StableDiffusionImg2ImgPipeline,
+    StableDiffusionControlNetImg2ImgPipeline,
+    ControlNetModel,
+    DDIMScheduler,
+)
+from peft import PeftModel # 必须导入 peft
+
+class PixelArtGenerator:
+    def __init__(
+        self,
+        base_model_path: str = "models/sd15",
+        # 注意：这里传 lora_dir（包含 safetensors 和 json 的目录）
+        lora_dir: str = "models/lora/1bit", 
+        controlnet_path: str = "models/controlnet_canny",
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float16
+    ):
+        self.device = device
+        self.dtype = dtype
+        
+        print(f"--- Step 1: Loading Base SD Model ---")
+        self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+            base_model_path,
+            torch_dtype=dtype,
+            safety_checker=None,
+            requires_safety_checker=False
+        ).to(device)
+        
+        # --- 核心修复：使用 PEFT 包装 UNet ---
+        print(f"--- Step 2: Loading LoRA via PEFT ---")
+        # 如果你训练时只保存了 .safetensors 文件，确保该目录下也有 adapter_config.json
+        # 如果报错，请确认 lora_dir 路径是否正确
+        try:
+            self.pipe.unet = PeftModel.from_pretrained(
+                self.pipe.unet, 
+                lora_dir, 
+                adapter_name="pixel_lora"
+            ).to(device)
+            print("Successfully loaded LoRA weights into UNet.")
+        except Exception as e:
+            print(f"LoRA Load Error: {e}")
+            print("Tips: Ensure both adapter_model.safetensors and adapter_config.json exist in the directory.")
+        
+        self.pipe.scheduler = DDIMScheduler.from_config(
+            self.pipe.scheduler.config,
+            rescale_betas_zero_snr=True,
+            timestep_spacing="trailing"
+        )
+        
+        print(f"--- Step 3: Loading ControlNet ---")
+        self.controlnet = ControlNetModel.from_pretrained(
+            controlnet_path, torch_dtype=dtype
+        ).to(device)
+        
+        # 构建 ControlNet 管道
+        self.controlnet_pipe = StableDiffusionControlNetImg2ImgPipeline(
+            vae=self.pipe.vae,
+            text_encoder=self.pipe.text_encoder,
+            tokenizer=self.pipe.tokenizer,
+            unet=self.pipe.unet, # 这里的 unet 已经带了 LoRA
+            controlnet=self.controlnet,
+            scheduler=self.pipe.scheduler,
+            feature_extractor=None,
+            safety_checker=None,
+            requires_safety_checker=False
+        ).to(device)
+
+    def grid_quantization_callback(self, pipe, step_index, timestep, callback_kwargs):
+        latents = callback_kwargs["latents"]
+        grid_size = 1 
+        s = latents.shape
+        latents = F.avg_pool2d(latents, kernel_size=grid_size, stride=grid_size)
+        latents = F.interpolate(latents, size=(s[2], s[3]), mode='nearest')
+        callback_kwargs["latents"] = latents
+        return callback_kwargs
+
+    def post_process_1bit(self, image: Image.Image, pixel_size: int = 8) -> Image.Image:
+        # 1bit 强制处理：转灰度 -> 二值化 -> 像素缩放
+        gray = image.convert('L')
+        img_array = np.array(gray)
+        binary = ((img_array > 127) * 255).astype(np.uint8)
+        binary_img = Image.fromarray(binary, mode='L').convert('RGB')
+        
+        w, h = binary_img.size
+        small = binary_img.resize((max(1, w // pixel_size), max(1, h // pixel_size)), Image.NEAREST)
+        return small.resize((w, h), Image.NEAREST)
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        image_path: str,
+        prompt: str = "1bit pixel art, black and white, monochrome, nes style, sharp edges",
+        negative_prompt: str = "color, gradient, blurry, text, gray, dithered",
+        strength: float = 0.8,
+        controlnet_scale: float = 0.6,
+        pixel_size: int = 8,
+        seed: int = 42
+    ) -> Tuple[Image.Image, Image.Image, Image.Image]: # 返回值改为 3 个
+        
+        init_image = Image.open(image_path).convert("RGB")
+        w, h = init_image.size
+        # 确保尺寸是 8 的倍数（VAE 限制）
+        new_w, new_h = (w // 8) * 8, (h // 8) * 8
+        init_image = init_image.resize((new_w, new_h))
+        
+        # --- Canny 边缘检测提取 ---
+        img_array = np.array(init_image)
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        # 这里的 100/200 是阈值，可以根据需要调整细节丰富度
+        edges = cv2.Canny(gray, 100, 200)
+        # 将单通道 edges 转回 RGB 以便保存和显示
+        canny_image = Image.fromarray(cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB))
+        
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        
+        print("Running Diffusion...")
+        raw_result = self.controlnet_pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=init_image,
+            control_image=canny_image, # 此时尺寸已对齐
+            strength=strength,
+            num_inference_steps=30,
+            guidance_scale=15.0,
+            controlnet_conditioning_scale=controlnet_scale,
+            generator=generator,
+            callback_on_step_end=self.grid_quantization_callback,
+            callback_on_step_end_tensor_inputs=["latents"]
+        ).images[0]
+
+        processed_result = self.post_process_1bit(raw_result, pixel_size=pixel_size)
+        
+        # 返回 Canny图, 模型图, 最终图
+        return canny_image, raw_result, processed_result
+
+def main():
+    base_dir = "/root/autodl-tmp/SD-pixelization-2"
+    
+    gen = PixelArtGenerator(
+        base_model_path=f"{base_dir}/models/sd15",
+        lora_dir=f"{base_dir}/models/lora/1bit", 
+        controlnet_path=f"{base_dir}/models/controlnet_canny"
+    )
+    
+    # 接收三个返回值
+    canny, raw, final = gen.generate(
+        image_path=f"{base_dir}/input.png",
+        strength=0.8,
+        controlnet_scale=0.5,
+        pixel_size=8
+    )
+    
+    # 分别保存
+    canny.save(f"{base_dir}/output_canny.png") # 保存 Canny 图
+    raw.save(f"{base_dir}/output_raw.png")
+    final.save(f"{base_dir}/output_final.png")
+    
+    print(f"--- All results saved ---")
+    print(f"1. Canny Guidance: output_canny.png")
+    print(f"2. Raw Diffusion Result: output_raw.png")
+    print(f"3. Final 1-bit Result: output_final.png")
+
+
+
+if __name__ == "__main__":
+    main()
