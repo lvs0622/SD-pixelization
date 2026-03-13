@@ -1,0 +1,46 @@
+import os
+from PIL import Image, ImageEnhance
+import random
+
+input_dir = "dataset/1bit/pre_train"       # 原始严格像素化训练集
+output_dir = "dataset/1bit/train"   # 输出增强后的训练集
+os.makedirs(output_dir, exist_ok=True)
+
+# 每张图生成几种增强版本
+num_augment = 4  
+
+# 可选增强操作
+rotation_angles = [0, 90, 180, 270]
+
+def enhance_image(img):
+    # 随机水平翻转
+    if random.random() < 0.5:
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    # 随机垂直翻转
+    if random.random() < 0.5:
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    # 随机旋转
+    angle = random.choice(rotation_angles)
+    img = img.rotate(angle)
+    # 小幅亮度/对比度调整
+    img = ImageEnhance.Brightness(img).enhance(random.uniform(0.9, 1.1))
+    img = ImageEnhance.Contrast(img).enhance(random.uniform(0.9, 1.1))
+    return img
+
+count = 0
+for fname in os.listdir(input_dir):
+    if not fname.lower().endswith((".png",".jpg",".jpeg")):
+        continue
+    img = Image.open(os.path.join(input_dir, fname)).convert("L")  # 保证灰度
+    # 保存原图
+    save_path = os.path.join(output_dir, fname)
+    img.save(save_path)
+    count += 1
+    # 生成增强版本
+    for i in range(num_augment):
+        img_aug = enhance_image(img)
+        save_name = f"{os.path.splitext(fname)[0]}_aug{i}.png"
+        img_aug.save(os.path.join(output_dir, save_name))
+        count += 1
+
+print(f"增强完成，总共生成 {count} 张图片")
